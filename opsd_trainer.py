@@ -14,11 +14,14 @@
 
 import os
 import random
+import re
 import textwrap
 import warnings
+import json
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -28,6 +31,7 @@ import torch.nn.functional as F
 from accelerate import PartialState
 from accelerate.utils import DistributedType, broadcast_object_list, gather_object, is_peft_model
 from datasets import Dataset, IterableDataset
+from torch.utils.data import DataLoader
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers.data.data_collator import DataCollator
 from transformers.feature_extraction_utils import FeatureExtractionMixin
@@ -63,6 +67,11 @@ from trl.trainer.utils import (
 from trl.experimental.gold.gold_config import GOLDConfig
 from data_collator import SelfDistillationDataCollator
 
+try:
+    from math_verify import parse, verify
+except ImportError:
+    parse = verify = None
+
 
 if is_peft_available():
     from peft import PeftConfig
@@ -79,6 +88,68 @@ if is_rich_available():
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+
+
+def _extract_boxed_answer(text: str | None) -> str | None:
+    if not text:
+        return None
+
+    think_end = text.rfind("</think>")
+    search_text = text[think_end + len("</think>") :] if think_end != -1 else text
+
+    idx = search_text.find(r"\boxed{")
+    if idx == -1:
+        return None
+
+    start = idx + len(r"\boxed{")
+    depth = 1
+    i = start
+    while i < len(search_text) and depth > 0:
+        if search_text[i] == "{":
+            depth += 1
+        elif search_text[i] == "}":
+            depth -= 1
+        i += 1
+
+    if depth == 0:
+        return search_text[start : i - 1].strip()
+    return None
+
+
+def _preprocess_for_parse(answer: str | None) -> str | None:
+    if answer is None:
+        return None
+    ratio_match = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*", answer)
+    if ratio_match:
+        return rf"\frac{{{ratio_match.group(1)}}}{{{ratio_match.group(2)}}}"
+    return answer
+
+
+def reward_correctness_from_solutions(completions: list[str], solutions: list[str]) -> list[float]:
+    rewards = []
+    for completion, solution in zip(completions, solutions):
+        pred_answer = _extract_boxed_answer(completion)
+        gt_answer = _extract_boxed_answer(solution) or (solution.strip() if solution else "")
+        reward = 0.0
+
+        if parse is not None and verify is not None:
+            gold_parsed = parse(gt_answer)
+            pred_parsed = parse(_preprocess_for_parse(pred_answer))
+            if gold_parsed is not None and pred_parsed is not None:
+                try:
+                    reward = 1.0 if verify(gold_parsed, pred_parsed) else 0.0
+                except Exception:
+                    reward = 0.0
+
+        if reward == 0.0:
+            pred_norm = re.sub(r"\s+", "", pred_answer or "").lower()
+            gt_norm = re.sub(r"\s+", "", gt_answer or "").lower()
+            if pred_norm and pred_norm == gt_norm:
+                reward = 1.0
+
+        rewards.append(reward)
+
+    return rewards
 
 
 class EMAUpdateCallback(TrainerCallback):
@@ -116,6 +187,17 @@ class GOLDVLLMSyncCallback(TrainerCallback):
                 self.trainer._last_vllm_sync_step = state.global_step
 
 
+class PeriodicSFTCallback(TrainerCallback):
+    """Trigger remediation SFT after optimizer steps."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if self.trainer.accelerator.sync_gradients:
+            self.trainer._maybe_run_periodic_sft()
+
+
 class OPSDTrainer(SFTTrainer):
     _tag_names = ["trl", "opsd"]
     _name = "OPSD"
@@ -141,6 +223,14 @@ class OPSDTrainer(SFTTrainer):
         top_k_loss: int | None = None,
         use_ema_teacher: bool = False,
         ema_decay: float = 0.999,
+        num_generations: int = 1,
+        low_advantage_threshold: float = -0.5,
+        periodic_sft_interval: int = 1000,
+        periodic_sft_dataset_size: int = 5000,
+        periodic_sft_epochs: int = 1,
+        periodic_sft_batch_size: int = 1,
+        periodic_sft_learning_rate: float = 5e-6,
+        periodic_sft_max_samples: int = 0,
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
@@ -182,7 +272,34 @@ class OPSDTrainer(SFTTrainer):
         self.top_k_loss = top_k_loss
         self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
+        self.num_generations = max(1, int(num_generations))
+        self.low_advantage_threshold = low_advantage_threshold
+        self.periodic_sft_interval = periodic_sft_interval
+        self.periodic_sft_dataset_size = periodic_sft_dataset_size
+        self.periodic_sft_epochs = periodic_sft_epochs
+        self.periodic_sft_batch_size = periodic_sft_batch_size
+        self.periodic_sft_learning_rate = periodic_sft_learning_rate
+        self.periodic_sft_max_samples = periodic_sft_max_samples
         self._ema_params = None  # lazily initialized on first optimizer step
+        self._last_low_advantage_flags = None
+        self._last_response_advantages = None
+        self._sft_running = False
+
+        remediation_dir = Path(self.args.output_dir) / "remediation"
+        remediation_dir.mkdir(parents=True, exist_ok=True)
+        self.remediation_dir = remediation_dir
+        self.low_adv_student_path = remediation_dir / "low_adv_student_responses.jsonl"
+        self.low_adv_teacher_path = remediation_dir / "low_adv_teacher_responses.jsonl"
+        self.pending_sft_path = remediation_dir / "pending_sft_examples.jsonl"
+        self.sft_windows_dir = remediation_dir / "sft_windows"
+        self.sft_windows_dir.mkdir(parents=True, exist_ok=True)
+        self.sft_checkpoint_dir = remediation_dir / "sft_checkpoints"
+        self.sft_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.generations_dir = Path(self.args.output_dir) / "generations"
+        self.generations_dir.mkdir(parents=True, exist_ok=True)
+        self.question_response_dir = self.generations_dir / "question_rollouts"
+        self.question_response_dir.mkdir(parents=True, exist_ok=True)
+        self.sample_text_log_path = self.generations_dir / "sample_text.log"
 
         # Validate fixed_teacher option
         if self.fixed_teacher and peft_config is None:
@@ -218,6 +335,9 @@ class OPSDTrainer(SFTTrainer):
             print("Teacher will first reason about the privileged solution, then evaluate student's response")
             print(f"{'='*80}\n")
 
+        if self.periodic_sft_dataset_size > 0:
+            self.add_callback(PeriodicSFTCallback(self))
+
         # Track per-step loss statistics for on/off-policy batches (used in logging)
         self._on_policy_loss_total = 0.0
         self._off_policy_loss_total = 0.0
@@ -228,7 +348,10 @@ class OPSDTrainer(SFTTrainer):
 
         # Track generation outputs for saving
         self._generation_outputs_buffer = []
-        self._generation_save_frequency = 5  # Save every 5 steps
+        self._generation_save_frequency = 100
+        self._window_save_frequency = 100
+        self._question_response_buffer = []
+        self._sft_window_buffer = []
 
         self.generation_config = GenerationConfig(
             max_new_tokens=args.max_completion_length,
@@ -370,6 +493,7 @@ class OPSDTrainer(SFTTrainer):
                 if column not in self._signature_columns:
                     self._signature_columns.append(column)
 
+    # Knowledge distillation loss
     @staticmethod
     def generalized_jsd_loss(
         student_logits,
@@ -463,6 +587,113 @@ class OPSDTrainer(SFTTrainer):
         else:
             return jsd
 
+    @staticmethod
+    def generalized_jsd_loss_rl(
+        student_logits,
+        teacher_logits,
+        labels=None,
+        beta=0.5,
+        temperature=1.0,
+        reduction="batchmean",
+        logits_are_probs=False,
+        top_k=None,
+    ):
+        """
+        Compute a policy-gradient surrogate whose gradient matches generalized_jsd_loss.
+
+        The sampled tokens in labels are treated as on-policy actions from the student. For 0 < beta < 1, the
+        generalized JSD gradient with respect to the student distribution is:
+
+            grad JSD = E_{a ~ pi_student}[
+                (1 - beta) * (log pi_student(a) - log pi_mix(a)) * grad log pi_student(a)
+            ]
+
+        where pi_mix = (1 - beta) * pi_student + beta * pi_teacher. This is equivalent to the RL loss:
+
+            reward = (1 - beta) * (log pi_mix(a) - log pi_student(a))
+            loss   = - stop_grad(reward) * log pi_student(a)
+
+        The beta=1 endpoint matches KL(student || teacher). The beta=0 endpoint matches KL(teacher || student)
+        using an on-policy importance-weighted estimator.
+
+        Args:
+            student_logits:
+                Tensor of shape (batch_size, sequence_length, vocab_size)
+            teacher_logits:
+                Tensor of shape (batch_size, sequence_length, vocab_size)
+            labels:
+                Tensor of shape (batch_size, sequence_length) with -100 for padding tokens to ignore when computing
+                loss
+            beta:
+                Interpolation coefficient between 0 and 1, matching generalized_jsd_loss.
+            temperature:
+                Temperature applied before computing action log-probs (default: 1.0)
+            reduction:
+                Specifies the reduction to apply to the output (default: 'batchmean')
+            top_k:
+                Kept for backward-compatible call sites. Not used because the sampled action must remain available.
+
+        Returns:
+            loss: Scalar tensor with the RL-style policy objective
+        """
+        del logits_are_probs, top_k
+
+        if labels is None:
+            raise ValueError("labels are required for the RL-style objective because they identify sampled actions.")
+
+        if beta < 0 or beta > 1:
+            raise ValueError(f"beta must be between 0 and 1, got {beta}.")
+
+        mask = labels != -100
+        safe_labels = labels.masked_fill(~mask, 0)
+
+        student_logits = student_logits / temperature
+        teacher_logits = teacher_logits / temperature
+
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+
+        student_log_probs_sampled = torch.gather(
+            student_log_probs, dim=-1, index=safe_labels.unsqueeze(-1)
+        ).squeeze(-1)
+        teacher_log_probs_sampled = torch.gather(
+            teacher_log_probs, dim=-1, index=safe_labels.unsqueeze(-1)
+        ).squeeze(-1)
+
+        if beta == 0:
+            # generalized_jsd_loss(beta=0) is KL(teacher || student). With actions sampled from the student,
+            # q(a) / p(a) is the importance weight for an unbiased score-function estimator.
+            reward = torch.exp(teacher_log_probs_sampled - student_log_probs_sampled)
+        elif beta == 1:
+            # generalized_jsd_loss(beta=1) is KL(student || teacher).
+            reward = teacher_log_probs_sampled - student_log_probs_sampled
+        else:
+            beta_tensor = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
+            mixture_log_probs_sampled = torch.logsumexp(
+                torch.stack(
+                    [
+                        student_log_probs_sampled + torch.log1p(-beta_tensor),
+                        teacher_log_probs_sampled + torch.log(beta_tensor),
+                    ]
+                ),
+                dim=0,
+            )
+            reward = (1 - beta_tensor) * (mixture_log_probs_sampled - student_log_probs_sampled)
+
+        loss = -(reward.detach() * student_log_probs_sampled)
+        loss = loss[mask]
+
+        # Apply reduction
+        if reduction == "batchmean":
+            return loss.sum() / mask.sum().clamp_min(1)
+        elif reduction == "sum":
+            return loss.sum()
+        elif reduction == "mean":
+            return loss.mean()
+        else:
+            return loss
+
+    
     def _update_ema(self):
         """Update EMA parameters after an optimizer step.
 
@@ -610,54 +841,42 @@ class OPSDTrainer(SFTTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        Compute the self-distillation loss with memory-efficient log-prob extraction.
+        Compute the self-distillation loss with an RLSD-style advantage flow.
 
-        Memory optimization: Extract only needed log-probs immediately and free large tensors.
+        The loss is built from sampled token log-probabilities:
+          advantage = log π_teacher(a|x) - log π_student(a|x)
+          loss      = -E[stop_grad(advantage) * log π_student(a|x)]
+
+        This keeps the model and dataset usage unchanged while aligning the
+        advantage/loss computation with the RLSD training flow.
         """
-        # Get batch-level prompt lengths
+        del num_items_in_batch
+
+        # Batch-level prompt lengths define the sampled action span.
         student_prompt_len = inputs["student_prompt_length"]
         teacher_prompt_len = inputs["teacher_prompt_length"]
         sampled_token_ids = inputs["student_input_ids"][:, student_prompt_len:]
         shifted_labels = inputs["labels"][:, student_prompt_len:]
 
-        # === STUDENT FORWARD - Extract log-probs immediately ===
+        # === STUDENT FORWARD ===
         outputs_student = model(
             input_ids=inputs["student_input_ids"],
             attention_mask=inputs["student_attention_mask"],
         )
-
-        # Extract only what we need and convert to log-probs immediately
         student_logits = outputs_student.logits[:, student_prompt_len - 1 : -1, :]
 
-        if self.use_thinking_machines_loss:
-            # For reverse KL, we only need log-probs of sampled tokens
-            student_log_probs = F.log_softmax(student_logits / self.temperature, dim=-1)
-            student_log_probs_sampled = torch.gather(
-                student_log_probs, dim=-1, index=sampled_token_ids.unsqueeze(-1)
-            ).squeeze(-1)
-            del student_logits, student_log_probs  # Free immediately!
-        else:
-            # For JSD, keep logits (temperature will be applied in generalized_jsd_loss)
-            student_logits_for_loss = student_logits
-            del student_logits
-
-        # Free the full outputs (but keep reference for return_outputs if needed)
-        if return_outputs:
-            # Create a minimal output object to return (just the loss, no logits)
-            class MinimalOutput:
-                def __init__(self):
-                    self.loss = None
-
-            minimal_output = MinimalOutput()
-
-        del outputs_student
+        # Compute only sampled-token log-probabilities instead of materializing
+        # the full vocab-sized log_softmax tensor, which is the main OOM source.
+        student_logits = student_logits / self.temperature
+        student_selected_logits = torch.gather(
+            student_logits, dim=-1, index=sampled_token_ids.unsqueeze(-1)
+        ).squeeze(-1)
+        student_log_denom = torch.logsumexp(student_logits, dim=-1)
+        student_log_probs_sampled = student_selected_logits - student_log_denom
+        del outputs_student, student_logits, student_selected_logits, student_log_denom
         empty_cache()
 
-        # === TEACHER FORWARD - Extract log-probs immediately ===
-        # Choose teacher context based on mode:
-        #   use_ema_teacher  → swap in EMA weights temporarily
-        #   fixed_teacher    → disable LoRA adapters (base model = initial policy)
-        #   default (dynamic)→ no-op, use current student weights
+        # === TEACHER FORWARD ===
         if self.use_ema_teacher:
             adapter_context = self._ema_teacher_context(model)
         elif self.fixed_teacher and is_peft_model(model):
@@ -670,71 +889,62 @@ class OPSDTrainer(SFTTrainer):
                 input_ids=inputs["teacher_input_ids"],
                 attention_mask=inputs["teacher_attention_mask"],
             )
-
             teacher_logits = outputs_teacher.logits[:, teacher_prompt_len - 1 : -1, :]
-
-            if self.use_thinking_machines_loss:
-                teacher_log_probs = F.log_softmax(teacher_logits / self.temperature, dim=-1)
-                teacher_log_probs_sampled = torch.gather(
-                    teacher_log_probs, dim=-1, index=sampled_token_ids.unsqueeze(-1)
-                ).squeeze(-1)
-                del teacher_logits, teacher_log_probs  # Free immediately!
-            else:
-                teacher_logits_for_loss = teacher_logits
-                del teacher_logits
-
-            del outputs_teacher
+            teacher_logits = teacher_logits / self.temperature
+            teacher_selected_logits = torch.gather(
+                teacher_logits, dim=-1, index=sampled_token_ids.unsqueeze(-1)
+            ).squeeze(-1)
+            teacher_log_denom = torch.logsumexp(teacher_logits, dim=-1)
+            teacher_log_probs_sampled = teacher_selected_logits - teacher_log_denom
+            del outputs_teacher, teacher_logits, teacher_selected_logits, teacher_log_denom
             empty_cache()
 
-        # === COMPUTE LOSS with only small tensors ===
-        if self.use_thinking_machines_loss:
-            # Thinking Machines uses RL-style policy gradient:
-            # Advantage = log π_teacher(x) - log π_student(x)
-            # Loss = -E[Advantage * log π_student(x)]
-            #
-            # CRITICAL: advantage must be detached to prevent gradients flowing through it.
-            # We want: ∇θ L = -E[A(x) * ∇θ log π_student(x)]
-            # NOT: ∇θ L = -E[(T(x) - S(x)) * ∇θ S(x)] where both terms differentiate
-
-            advantage = (teacher_log_probs_sampled - student_log_probs_sampled).detach()
-
-            # Apply masking before computing loss
-            if shifted_labels is not None:
-                mask = shifted_labels != -100
-                advantage = advantage[mask]
-                student_log_probs_sampled_masked = student_log_probs_sampled[mask]
-            else:
-                student_log_probs_sampled_masked = student_log_probs_sampled
-
-            # Policy gradient loss: -advantage * log π_student
-            # Negative because we minimize loss (gradient descent), but want to maximize reward
-            loss = -(advantage * student_log_probs_sampled_masked).mean()
-
-            del (
-                student_log_probs_sampled,
-                teacher_log_probs_sampled,
-                advantage,
-                student_log_probs_sampled_masked,
+        # === RLSD-STYLE ADVANTAGE + LOSS ===
+        raw_advantage = (teacher_log_probs_sampled - student_log_probs_sampled).detach()
+        advantage = raw_advantage
+        response_mask = shifted_labels != -100
+        low_advantage_flags = ((raw_advantage < self.low_advantage_threshold) & response_mask).any(dim=1)
+        if "student_correct_flags" in inputs:
+            student_correct_flags = inputs["student_correct_flags"].to(
+                device=low_advantage_flags.device, dtype=torch.bool
             )
-        else:
-            # Temperature is applied inside generalized_jsd_loss
-            loss = self.generalized_jsd_loss(
-                student_logits=student_logits_for_loss,
-                teacher_logits=teacher_logits_for_loss,
-                labels=shifted_labels,
-                beta=self.beta,
-                temperature=self.temperature,  # Let the function handle temperature
-                top_k=self.top_k_loss,
-            )
-            del student_logits_for_loss, teacher_logits_for_loss
+            low_advantage_flags = low_advantage_flags & student_correct_flags
+        if low_advantage_flags.any():
+            advantage = advantage.clone()
+            advantage[low_advantage_flags] = 0.0
 
+        response_advantage_min = torch.where(
+            response_mask,
+            raw_advantage.masked_fill(~response_mask, float("inf")),
+            torch.full_like(raw_advantage, float("inf")),
+        ).amin(dim=1)
+        response_advantage_min = torch.where(
+            torch.isinf(response_advantage_min),
+            torch.zeros_like(response_advantage_min),
+            response_advantage_min,
+        )
+        self._last_low_advantage_flags = low_advantage_flags.detach().cpu().tolist()
+        self._last_response_advantages = response_advantage_min.detach().cpu().tolist()
+
+        if shifted_labels is not None:
+            mask = response_mask
+            advantage = advantage[mask]
+            student_log_probs_sampled = student_log_probs_sampled[mask]
+
+        loss = -(advantage * student_log_probs_sampled).mean()
+
+        del student_log_probs_sampled, teacher_log_probs_sampled, advantage
         empty_cache()
 
         if return_outputs:
+            class MinimalOutput:
+                def __init__(self):
+                    self.loss = None
+
+            minimal_output = MinimalOutput()
             minimal_output.loss = loss
-            return (loss, minimal_output)
-        else:
-            return loss
+            return loss, minimal_output
+        return loss
 
     def generate_teacher_reasoning(
         self, model, teacher_reasoning_prompts, teacher_reasoning_attention_mask=None
@@ -744,6 +954,9 @@ class OPSDTrainer(SFTTrainer):
             # Use vLLM for fast reasoning generation
             return self._generate_teacher_reasoning_vllm(teacher_reasoning_prompts)
         else:
+            generation_input_ids, generation_attention_mask = self._left_pad_for_generation(
+                teacher_reasoning_prompts, teacher_reasoning_attention_mask
+            )
             # Use transformers generation (slower)
             with torch.no_grad():
                 # Temporarily enable KV cache
@@ -763,8 +976,8 @@ class OPSDTrainer(SFTTrainer):
                 try:
                     with adapter_context:
                         reasoning_outputs = model.generate(
-                            input_ids=teacher_reasoning_prompts,
-                            attention_mask=teacher_reasoning_attention_mask,
+                            input_ids=generation_input_ids,
+                            attention_mask=generation_attention_mask,
                             generation_config=self.reasoning_generation_config,
                             return_dict_in_generate=True,
                             use_cache=True,
@@ -781,6 +994,10 @@ class OPSDTrainer(SFTTrainer):
         import time
 
         start_time = time.time()
+        generation_input_ids, generation_attention_mask = self._left_pad_for_generation(
+            inputs["student_prompts"],
+            inputs.get("student_prompt_attention_mask", None),
+        )
 
         # Temporarily enable KV cache for generation if it was disabled for training
         original_use_cache = model.config.use_cache
@@ -795,16 +1012,16 @@ class OPSDTrainer(SFTTrainer):
         print(f"  Model config use_cache: {model.config.use_cache}")
         print(f"  Attention implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
         print(f"  Generation config use_cache: {generation_config.use_cache}")
-        print(f"  Batch size: {inputs['student_prompts'].shape[0]}")
-        print(f"  Prompt length: {inputs['student_prompts'].shape[1]}")
+        print(f"  Batch size: {generation_input_ids.shape[0]}")
+        print(f"  Prompt length: {generation_input_ids.shape[1]}")
         print(f"  Max new tokens: {generation_config.max_new_tokens}")
         print(f"{'='*80}\n")
 
         # Generate output with respect to the student prompt only
         try:
             generated_outputs = model.generate(
-                input_ids=inputs["student_prompts"],
-                attention_mask=inputs.get("student_prompt_attention_mask", None),
+                input_ids=generation_input_ids,
+                attention_mask=generation_attention_mask,
                 generation_config=generation_config,
                 return_dict_in_generate=True,
                 use_cache=True,
@@ -818,7 +1035,7 @@ class OPSDTrainer(SFTTrainer):
 
         elapsed_time = time.time() - start_time
         num_prompts = generated_tokens.shape[0]
-        total_completion_tokens = generated_tokens.shape[1] - inputs["student_prompts"].shape[1]
+        total_completion_tokens = generated_tokens.shape[1] - generation_input_ids.shape[1]
         num_tokens = total_completion_tokens * num_prompts
         avg_completion_length = total_completion_tokens
         tokens_per_sec = num_tokens / elapsed_time if elapsed_time > 0 else 0
@@ -966,14 +1183,19 @@ class OPSDTrainer(SFTTrainer):
         prompt_max_length = (
             max(1, self.args.max_length - max_completion_length) if self.args.max_length else None
         )
-        prompt_tokenized = self.processing_class(
-            prompts_text_for_vllm,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True if prompt_max_length else False,
-            max_length=prompt_max_length,
-            add_special_tokens=False,
-        ).to(device)
+        original_padding_side = self.processing_class.padding_side
+        self.processing_class.padding_side = "left"
+        try:
+            prompt_tokenized = self.processing_class(
+                prompts_text_for_vllm,
+                return_tensors="pt",
+                padding="longest",
+                truncation=True if prompt_max_length else False,
+                max_length=prompt_max_length,
+                add_special_tokens=False,
+            ).to(device)
+        finally:
+            self.processing_class.padding_side = original_padding_side
         prompt_ids = prompt_tokenized.input_ids
 
         completion_ids_tensors = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -1110,13 +1332,18 @@ class OPSDTrainer(SFTTrainer):
         )
 
         # Combine prompt + completion
-        prompt_tokenized = self.processing_class(
-            prompts_text,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            add_special_tokens=False,
-        ).to(device)
+        original_padding_side = self.processing_class.padding_side
+        self.processing_class.padding_side = "left"
+        try:
+            prompt_tokenized = self.processing_class(
+                prompts_text,
+                return_tensors="pt",
+                padding="longest",
+                truncation=True,
+                add_special_tokens=False,
+            ).to(device)
+        finally:
+            self.processing_class.padding_side = original_padding_side
         prompt_ids = prompt_tokenized.input_ids
 
         completion_ids_tensors = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -1269,6 +1496,503 @@ class OPSDTrainer(SFTTrainer):
         # Clear buffer after saving
         self._generation_outputs_buffer.clear()
 
+    @staticmethod
+    def _flatten_gathered_records(records):
+        if not records:
+            return []
+        if isinstance(records, list) and records and isinstance(records[0], dict):
+            return records
+        flat = []
+        for item in records:
+            if isinstance(item, list):
+                flat.extend(item)
+            elif isinstance(item, dict):
+                flat.append(item)
+        return flat
+
+    def _append_jsonl_records(self, path: Path, records: list[dict[str, Any]]) -> None:
+        if not records or not self.accelerator.is_main_process:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _append_sample_text_log(self, title: str, payload: dict[str, Any]) -> None:
+        if not self.accelerator.is_main_process:
+            return
+        self.sample_text_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.sample_text_log_path, "a", encoding="utf-8") as f:
+            f.write(f"{'=' * 80}\n")
+            f.write(f"{title}\n")
+            f.write(f"{'=' * 80}\n")
+            for key, value in payload.items():
+                f.write(f"{key}:\n{value}\n\n")
+
+    def _load_jsonl_records(self, path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        records = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
+    def _write_jsonl_records(self, path: Path, records: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _window_start_step(step: int, window_size: int) -> int:
+        return max(1, step - window_size + 1)
+
+    def _write_json_payload(self, path: Path, payload: dict[str, Any]) -> None:
+        if not self.accelerator.is_main_process:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _group_prompt_indices(prompt_texts: list[str]) -> list[list[int]]:
+        if not prompt_texts:
+            return []
+        groups: list[list[int]] = []
+        current_group = [0]
+        for idx in range(1, len(prompt_texts)):
+            if prompt_texts[idx] == prompt_texts[current_group[0]]:
+                current_group.append(idx)
+            else:
+                groups.append(current_group)
+                current_group = [idx]
+        groups.append(current_group)
+        return groups
+
+    def _record_question_response_window(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        prompt_texts: list[str],
+        completion_texts: list[str],
+    ) -> None:
+        prompt_groups = self._group_prompt_indices(prompt_texts)
+        if not prompt_groups:
+            return
+
+        teacher_prompt_rows = [group[0] for group in prompt_groups]
+        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+            teacher_responses = self._generate_teacher_completions(
+                unwrapped_model,
+                inputs["teacher_prompts"][teacher_prompt_rows],
+                inputs["teacher_prompt_attention_mask"][teacher_prompt_rows],
+                int(inputs["teacher_prompt_length"]),
+            )
+
+        solution_rows = [inputs["solutions"][group[0]] for group in prompt_groups]
+        student_rewards = reward_correctness_from_solutions(completion_texts, inputs["solutions"])
+        teacher_rewards = reward_correctness_from_solutions(teacher_responses, solution_rows)
+
+        records = []
+        for question_idx, group in enumerate(prompt_groups):
+            sample_idx = group[0]
+            records.append(
+                {
+                    "step": int(self.state.global_step),
+                    "question_index_in_step": int(question_idx),
+                    "problem": inputs["problems"][sample_idx],
+                    "prompt": prompt_texts[sample_idx],
+                    "student_responses": [completion_texts[idx] for idx in group],
+                    "student_rewards": [float(student_rewards[idx]) for idx in group],
+                    "teacher_response": teacher_responses[question_idx],
+                    "teacher_reward": float(teacher_rewards[question_idx]),
+                }
+            )
+
+        gathered_records = gather_object(records)
+        gathered_records = self._flatten_gathered_records(gathered_records)
+        if self.accelerator.is_main_process and gathered_records:
+            self._question_response_buffer.extend(gathered_records)
+
+    def _flush_question_response_window(self, step: int) -> None:
+        if not self.accelerator.is_main_process or not self._question_response_buffer:
+            return
+        start_step = self._window_start_step(step, self._window_save_frequency)
+        out_path = self.question_response_dir / f"question_rollouts_step_{start_step:06d}_{step:06d}.json"
+        payload = {
+            "step_start": start_step,
+            "step_end": int(step),
+            "num_questions": len(self._question_response_buffer),
+            "records": self._question_response_buffer,
+        }
+        self._write_json_payload(out_path, payload)
+        self._question_response_buffer.clear()
+
+    def _flush_sft_window_buffer(self, step: int) -> None:
+        if not self.accelerator.is_main_process or not self._sft_window_buffer:
+            return
+        start_step = self._window_start_step(step, self._window_save_frequency)
+        out_path = self.sft_windows_dir / f"sft_examples_step_{start_step:06d}_{step:06d}.jsonl"
+        self._write_jsonl_records(out_path, self._sft_window_buffer)
+        self._append_jsonl_records(self.pending_sft_path, self._sft_window_buffer)
+        self._sft_window_buffer.clear()
+
+    def _flush_window_buffers(self, step: int) -> None:
+        self._flush_question_response_window(step)
+        self._flush_sft_window_buffer(step)
+
+    def _build_problem_prompt(self, problem: str) -> str:
+        user_message = (
+            f"Problem: {problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        )
+        return self.processing_class.apply_chat_template(
+            [{"role": "user", "content": user_message}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def _build_sft_batch(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        original_padding_side = self.processing_class.padding_side
+        self.processing_class.padding_side = "right"
+        prompts = [self._build_problem_prompt(example["problem"]) for example in examples]
+        responses = [example["response"] for example in examples]
+        full_texts = [prompt + response for prompt, response in zip(prompts, responses)]
+
+        try:
+            prompt_ids = self.processing_class(
+                prompts,
+                padding=False,
+                truncation=True,
+                max_length=self.args.max_length,
+            )["input_ids"]
+            prompt_lengths = [len(ids) for ids in prompt_ids]
+
+            encoded = self.processing_class(
+                full_texts,
+                padding="longest",
+                truncation=True,
+                max_length=self.args.max_length,
+                return_tensors="pt",
+            )
+        finally:
+            self.processing_class.padding_side = original_padding_side
+
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        labels = input_ids.clone()
+        for i, prompt_len in enumerate(prompt_lengths):
+            labels[i, :prompt_len] = -100
+        labels[attention_mask == 0] = -100
+        if self.processing_class.pad_token_id is not None:
+            labels[input_ids == self.processing_class.pad_token_id] = -100
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    def _sft_collate_fn(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        return self._build_sft_batch(examples)
+
+    def _left_pad_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if attention_mask is None:
+            if self.processing_class.pad_token_id is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            else:
+                attention_mask = (input_ids != self.processing_class.pad_token_id).long()
+
+        token_seqs = []
+        mask_seqs = []
+        for ids, mask in zip(input_ids, attention_mask):
+            valid_ids = ids[mask.bool()]
+            token_seqs.append(valid_ids)
+            mask_seqs.append(torch.ones_like(valid_ids, dtype=torch.long))
+
+        pad_token_id = self.processing_class.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.processing_class.eos_token_id
+
+        padded_ids = pad(token_seqs, padding_value=pad_token_id, padding_side="left")
+        padded_mask = pad(mask_seqs, padding_value=0, padding_side="left")
+        return padded_ids, padded_mask
+
+    def _repeat_generation_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        if self.num_generations <= 1:
+            return inputs
+
+        repeated_inputs: dict[str, Any] = {}
+        repeatable_tensor_keys = {
+            "student_prompts",
+            "student_prompt_attention_mask",
+            "teacher_prompts",
+            "teacher_prompt_attention_mask",
+            "teacher_reasoning_prompts",
+            "teacher_reasoning_attention_mask",
+            "teacher_transition_tokens",
+        }
+        repeatable_list_keys = {"problems", "solutions"}
+
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor) and key in repeatable_tensor_keys:
+                repeated_inputs[key] = value.repeat_interleave(self.num_generations, dim=0)
+            elif isinstance(value, list) and key in repeatable_list_keys:
+                repeated_inputs[key] = [item for item in value for _ in range(self.num_generations)]
+            else:
+                repeated_inputs[key] = value
+
+        return repeated_inputs
+
+    def _generate_teacher_completions(
+        self,
+        model: nn.Module,
+        teacher_prompts: torch.Tensor,
+        teacher_attention_mask: torch.Tensor,
+        teacher_prompt_length: int,
+    ) -> list[str]:
+        if teacher_prompts.shape[0] == 0:
+            return []
+
+        generation_input_ids, generation_attention_mask = self._left_pad_for_generation(
+            teacher_prompts, teacher_attention_mask
+        )
+
+        with torch.no_grad():
+            original_use_cache = model.config.use_cache
+            original_gen_use_cache = self.generation_config.use_cache
+            model.config.use_cache = True
+            self.generation_config.use_cache = True
+
+            if self.use_ema_teacher:
+                adapter_context = self._ema_teacher_context(model)
+            elif self.fixed_teacher and is_peft_model(model):
+                adapter_context = self.accelerator.unwrap_model(model).disable_adapter()
+            else:
+                adapter_context = nullcontext()
+
+            try:
+                with adapter_context:
+                    generated = model.generate(
+                        input_ids=generation_input_ids,
+                        attention_mask=generation_attention_mask,
+                        generation_config=self.generation_config,
+                        return_dict_in_generate=True,
+                        use_cache=True,
+                    )
+                    generated_ids = generated.sequences
+            finally:
+                model.config.use_cache = original_use_cache
+                self.generation_config.use_cache = original_gen_use_cache
+
+        completion_ids = generated_ids[:, generation_input_ids.shape[1] :]
+        return self.processing_class.batch_decode(completion_ids, skip_special_tokens=False)
+
+    def _record_low_advantage_examples(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        prompt_texts: list[str],
+        completion_texts: list[str],
+    ) -> None:
+        low_mask = self._last_low_advantage_flags
+        response_advantages = self._last_response_advantages
+        if low_mask is None or response_advantages is None:
+            return
+
+        flagged_indices = [idx for idx, is_flagged in enumerate(low_mask) if is_flagged]
+        if not flagged_indices:
+            return
+
+        correctness_rewards = reward_correctness_from_solutions(completion_texts, inputs["solutions"])
+        eligible_indices = [idx for idx in flagged_indices if correctness_rewards[idx] > 0.5]
+
+        student_records = []
+        for idx in flagged_indices:
+            student_records.append(
+                {
+                    "step": int(self.state.global_step),
+                    "problem": inputs["problems"][idx],
+                    "student_prompt": prompt_texts[idx],
+                    "student_response": completion_texts[idx],
+                    "student_reward": float(correctness_rewards[idx]),
+                    "response_advantage_min": float(response_advantages[idx]),
+                    "threshold": float(self.low_advantage_threshold),
+                }
+            )
+
+        gathered_student = gather_object(student_records)
+        gathered_student = self._flatten_gathered_records(gathered_student)
+        self._append_jsonl_records(self.low_adv_student_path, gathered_student)
+
+        if not eligible_indices:
+            return
+
+        sft_records = []
+        for sample_idx in eligible_indices:
+            sft_records.append(
+                {
+                    "step": int(self.state.global_step),
+                    "problem": inputs["problems"][sample_idx],
+                    "response": completion_texts[sample_idx],
+                    "source": "student_correct_response",
+                    "student_reward": float(correctness_rewards[sample_idx]),
+                    "response_advantage_min": float(response_advantages[sample_idx]),
+                    "threshold": float(self.low_advantage_threshold),
+                }
+            )
+
+        teacher_group_indices = []
+        last_problem = None
+        for sample_idx in eligible_indices:
+            problem = inputs["problems"][sample_idx]
+            if problem != last_problem:
+                teacher_group_indices.append(sample_idx)
+                last_problem = problem
+
+        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+            teacher_completions = self._generate_teacher_completions(
+                unwrapped_model,
+                inputs["teacher_prompts"][teacher_group_indices],
+                inputs["teacher_prompt_attention_mask"][teacher_group_indices],
+                int(inputs["teacher_prompt_length"]),
+            )
+
+        teacher_rewards = reward_correctness_from_solutions(
+            teacher_completions,
+            [inputs["solutions"][sample_idx] for sample_idx in teacher_group_indices],
+        )
+
+        for local_idx, sample_idx in enumerate(teacher_group_indices):
+            sft_records.append(
+                {
+                    "step": int(self.state.global_step),
+                    "problem": inputs["problems"][sample_idx],
+                    "response": teacher_completions[local_idx],
+                    "source": "teacher_response",
+                    "teacher_reward": float(teacher_rewards[local_idx]),
+                    "threshold": float(self.low_advantage_threshold),
+                }
+            )
+
+        gathered_sft = gather_object(sft_records)
+        gathered_sft = self._flatten_gathered_records(gathered_sft)
+        if self.accelerator.is_main_process and gathered_sft:
+            self._sft_window_buffer.extend(gathered_sft)
+
+    def _run_periodic_sft(self) -> None:
+        if self._sft_running:
+            return
+
+        self.accelerator.wait_for_everyone()
+        pending_examples = self._load_jsonl_records(self.pending_sft_path) if self.accelerator.is_main_process else None
+        pending_examples = broadcast_object_list([pending_examples], from_process=0)[0]
+        if not pending_examples:
+            if self.accelerator.is_main_process:
+                print("Periodic SFT skipped: no pending remediation examples.")
+            return
+
+        if len(pending_examples) < self.periodic_sft_dataset_size:
+            if self.accelerator.is_main_process:
+                print(
+                    "Periodic SFT skipped: "
+                    f"{len(pending_examples)}/{self.periodic_sft_dataset_size} samples collected."
+                )
+            return
+
+        current_sft_examples = pending_examples[: self.periodic_sft_dataset_size]
+        remaining_examples = pending_examples[self.periodic_sft_dataset_size :]
+
+        if self.periodic_sft_max_samples > 0:
+            current_sft_examples = current_sft_examples[: self.periodic_sft_max_samples]
+
+        self._sft_running = True
+        original_lr = [group["lr"] for group in self.optimizer.param_groups]
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.periodic_sft_learning_rate
+
+        try:
+            print(f"\n{'='*80}")
+            print(
+                f"STARTING PERIODIC SFT AT STEP {self.state.global_step} "
+                f"WITH {len(current_sft_examples)} REMEDIATION EXAMPLES"
+            )
+            print(f"{'='*80}\n")
+
+            sft_loader = DataLoader(
+                current_sft_examples,
+                batch_size=self.periodic_sft_batch_size,
+                shuffle=True,
+                collate_fn=self._sft_collate_fn,
+            )
+            self.model.train()
+
+            for epoch_idx in range(self.periodic_sft_epochs):
+                epoch_loss = 0.0
+                step_count = 0
+                for batch in sft_loader:
+                    batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
+                    self.optimizer.zero_grad(set_to_none=True)
+                    outputs = self.model(**batch)
+                    loss = outputs.loss
+                    self.accelerator.backward(loss)
+                    self.optimizer.step()
+                    self.lr_scheduler.step()
+                    epoch_loss += float(loss.detach())
+                    step_count += 1
+
+                avg_loss = epoch_loss / max(1, step_count)
+                print(
+                    f"Periodic SFT epoch {epoch_idx + 1}/{self.periodic_sft_epochs} "
+                    f"completed, avg_loss={avg_loss:.4f}"
+                )
+
+            if self.accelerator.is_main_process:
+                sft_checkpoint = self.sft_checkpoint_dir / f"step_{self.state.global_step}"
+                self.save_model(str(sft_checkpoint))
+                metadata = {
+                    "step": int(self.state.global_step),
+                    "num_examples": len(current_sft_examples),
+                    "epochs": int(self.periodic_sft_epochs),
+                    "learning_rate": float(self.periodic_sft_learning_rate),
+                    "target_dataset_size": int(self.periodic_sft_dataset_size),
+                }
+                with open(sft_checkpoint / "remediation_sft_metadata.json", "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+                archive_path = self.remediation_dir / f"consumed_sft_examples_step_{self.state.global_step}.jsonl"
+                self._write_jsonl_records(archive_path, current_sft_examples)
+                self._write_jsonl_records(self.pending_sft_path, remaining_examples)
+
+            if self.use_vllm:
+                self._move_model_to_vllm()
+
+            if self.accelerator.is_main_process:
+                print(f"\n{'='*80}")
+                print(f"PERIODIC SFT COMPLETED AT STEP {self.state.global_step}")
+                print(f"SFT checkpoint saved to: {sft_checkpoint}")
+                print(f"{'='*80}\n")
+        finally:
+            self.accelerator.wait_for_everyone()
+            for group, lr in zip(self.optimizer.param_groups, original_lr):
+                group["lr"] = lr
+            self.optimizer.zero_grad(set_to_none=True)
+            self._sft_running = False
+            empty_cache()
+
+    def _maybe_run_periodic_sft(self) -> None:
+        if self.periodic_sft_dataset_size <= 0:
+            return
+        if self.state.global_step <= 0:
+            return
+        self._run_periodic_sft()
+
     @profiling_decorator
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
@@ -1312,18 +2036,17 @@ class OPSDTrainer(SFTTrainer):
 
                 # Occasionally print reasoning
                 if random.random() < 0.01:
-                    print(f"\n{'='*80}")
-                    print(f"TEACHER REASONING SAMPLE (Step {self.state.global_step}):")
-                    print(f"{'='*80}")
                     sample_idx = random.randint(0, len(reasoning_texts) - 1)
-                    print(f"\n{'='*80}")
-                    # Decode the prompt from token IDs to text
                     sample_prompt = self.processing_class.decode(
                         inputs["teacher_reasoning_prompts"][sample_idx], skip_special_tokens=False
                     )
-                    print(f"PROMPT:\n{sample_prompt}")
-                    print(f"\nReasoning:\n{reasoning_texts[sample_idx]}")
-                    print(f"{'='*80}\n")
+                    self._append_sample_text_log(
+                        f"TEACHER REASONING SAMPLE (Step {self.state.global_step})",
+                        {
+                            "PROMPT": sample_prompt,
+                            "REASONING": reasoning_texts[sample_idx],
+                        },
+                    )
 
                 # Update teacher prompts with reasoning
                 # Construct: [teacher_reasoning_prompt][reasoning][transition_to_teaching]
@@ -1345,6 +2068,8 @@ class OPSDTrainer(SFTTrainer):
                     ] = 0
                 inputs["teacher_prompt_attention_mask"] = teacher_attention_mask
                 inputs["teacher_prompt_length"] = teacher_prompts_with_reasoning.shape[1]
+
+        inputs = self._repeat_generation_inputs(inputs)
 
         # === GENERATION PHASE ===
         if self.use_vllm:
@@ -1392,11 +2117,10 @@ class OPSDTrainer(SFTTrainer):
         inputs["teacher_attention_mask"] = teacher_attention_mask
 
         # Create labels for generation tokens
-        # Mask prompt tokens (use per-example lengths for accurate masking)
+        # Generation inputs are left-padded before sampling, so the whole prompt span is
+        # the shared prefix of length `student_prompt_len`.
         labels = generated_ids.clone()
-        for i in range(labels.shape[0]):
-            actual_prompt_len = inputs["student_prompt_lengths_per_example"][i].item()
-            labels[i, :actual_prompt_len] = -100  # Mask actual prompt
+        labels[:, :student_prompt_len] = -100
 
         if self.processing_class.pad_token_id is not None:
             labels[labels == self.processing_class.pad_token_id] = -100
@@ -1406,6 +2130,12 @@ class OPSDTrainer(SFTTrainer):
         # Log prompt and completion texts
         self._textual_logs["prompt"].extend(gather_object(prompt_texts))
         self._textual_logs["completion"].extend(gather_object(completion_texts))
+        correctness_rewards = reward_correctness_from_solutions(completion_texts, inputs["solutions"])
+        inputs["student_correct_flags"] = torch.tensor(
+            [reward > 0.5 for reward in correctness_rewards],
+            device=generated_ids.device,
+            dtype=torch.bool,
+        )
 
         # Collect generation outputs for saving
         for prompt, completion in zip(prompt_texts, completion_texts):
@@ -1415,15 +2145,19 @@ class OPSDTrainer(SFTTrainer):
 
         # Occasionally print student's generation with 10% probability
         if random.random() < 0.9:
-            print(f"\n{'='*80}")
-            print(f"STUDENT GENERATION SAMPLE (Step {self.state.global_step}):")
-            print(f"{'='*80}")
             sample_idx = random.randint(0, len(prompt_texts) - 1)
-            print(f"\nPrompt:\n{prompt_texts[sample_idx]}")
-            print(f"\nCompletion:\n{completion_texts[sample_idx]}")
-            print(f"{'='*80}\n")
+            self._append_sample_text_log(
+                f"STUDENT GENERATION SAMPLE (Step {self.state.global_step})",
+                {
+                    "PROMPT": prompt_texts[sample_idx],
+                    "COMPLETION": completion_texts[sample_idx],
+                },
+            )
 
+        self._record_question_response_window(model, inputs, prompt_texts, completion_texts)
         loss = super().training_step(model, inputs, num_items_in_batch)
+
+        self._record_low_advantage_examples(model, inputs, prompt_texts, completion_texts)
 
         # Save generation outputs every N steps
         if (
@@ -1432,6 +2166,7 @@ class OPSDTrainer(SFTTrainer):
             and self.accelerator.sync_gradients
         ):
             self._save_generation_outputs(self.state.global_step)
+            self._flush_window_buffers(self.state.global_step)
 
         loss_scalar = float(loss.detach())
         ga = max(1, int(self.args.gradient_accumulation_steps))

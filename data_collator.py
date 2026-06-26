@@ -120,6 +120,8 @@ class SelfDistillationDataCollator:
             "student_prompt_length": max_student_prompt_len,  # Single value for batch!
             # Keep individual lengths for proper masking
             "student_prompt_lengths_per_example": torch.tensor(student_prompt_lengths),
+            "problems": [feature["problem"] for feature in features],
+            "solutions": [feature["solution"] for feature in features],
         }
 
         if self.reason_first:

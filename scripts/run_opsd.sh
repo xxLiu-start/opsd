@@ -1,16 +1,19 @@
+export CUDA_VISIBLE_DEVICES=0
+export HF_ENDPOINT=https://hf-mirror.com
+
 accelerate launch \
     --config_file accelerate.yaml \
-    --num_processes 8 \
+    --num_processes 1 \
     --gradient_accumulation_steps 4 \
     --main_process_port 12949 \
     opsd_train.py \
-    --model_name_or_path /data0/shared/Qwen3-4B \
+    --model_name_or_path /data0/liuxule/project/models/Qwen2.5-1.5B-Instruct \
     --learning_rate 2e-5 \
     --per_device_train_batch_size 1 \
     --gradient_checkpointing \
     --gradient_accumulation_steps 4 \
-    --output_dir  /data0/siyanz/opsd/ \
-    --run_config qwen34b_gen2048_fixteacher_temp12_lr2e5 \
+    --output_dir  /data0/liuxule/project/OPSD/output/ \
+    --run_config qwen2.5-1.5B-Instruct_gen2048_fixteacher_temp12_lr2e5 \
     --num_train_epochs 30 \
     --max_completion_length 2048 \
     --save_steps 50 \
@@ -21,7 +24,7 @@ accelerate launch \
     --beta 0.5 \
     --use_vllm \
     --vllm_mode colocate \
-    --vllm_gpu_memory_utilization 0.6 \
+    --vllm_gpu_memory_utilization 0.4 \
     --vllm_tensor_parallel_size 1 \
     --use_peft \
     --lora_r 64 \

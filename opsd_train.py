@@ -84,6 +84,43 @@ class CustomScriptArguments(ScriptArguments):
             "Typical range: 0.99–0.9999. Only used when use_ema_teacher=True."
         },
     )
+    num_generations: int = field(
+        default=1,
+        metadata={"help": "Number of sampled student responses to generate for each problem in a training step."},
+    )
+    low_advantage_threshold: float = field(
+        default=-0.5,
+        metadata={
+            "help": "If any token in a sampled response has log pi_teacher - log pi_student below this threshold, "
+            "the entire response advantage is zeroed and the sample is added to the remediation set."
+        },
+    )
+    periodic_sft_interval: int = field(
+        default=1000,
+        metadata={"help": "Deprecated. Periodic SFT is now triggered by collected sample count instead of steps."},
+    )
+    periodic_sft_dataset_size: int = field(
+        default=5000,
+        metadata={"help": "Run an in-training SFT remediation pass whenever 5000 collected SFT samples are available."},
+    )
+    periodic_sft_epochs: int = field(
+        default=1,
+        metadata={"help": "Number of epochs to run over the collected remediation teacher samples each SFT pass."},
+    )
+    periodic_sft_batch_size: int = field(
+        default=1,
+        metadata={"help": "Per-device batch size for the in-training remediation SFT stage."},
+    )
+    periodic_sft_learning_rate: float = field(
+        default=5e-6,
+        metadata={"help": "Learning rate used during the in-training remediation SFT stage."},
+    )
+    periodic_sft_max_samples: int = field(
+        default=0,
+        metadata={
+            "help": "Optional cap on the number of pending remediation samples used per SFT pass. 0 means use all."
+        },
+    )
 
 
 if __name__ == "__main__":
@@ -144,6 +181,11 @@ if __name__ == "__main__":
         raise ValueError(
             "fixed_teacher=True requires use_peft=True. As the fixed teacher is implemented by disabling LoRA adapters."
         )
+
+    if not script_args.use_tinker_loss:
+        print("[WARN] Enabling use_tinker_loss to match RLSD training flow.")
+    if not script_args.fixed_teacher:
+        print("[WARN] Enabling fixed_teacher to match RLSD training flow.")
 
     # Only initialize wandb on main process (LOCAL_RANK 0 or not set)
     if os.environ.get("LOCAL_RANK", "0") == "0":
@@ -244,6 +286,16 @@ if __name__ == "__main__":
     dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
     train_dataset = dataset["train"]
 
+    # RLSD-style default behavior: fixed teacher + sampled-token advantage loss.
+    # Keep the dataset and model unchanged, but align the training objective with
+    # the Simple GRPO + RLSD flow used by EasyVideoR1.
+    if not script_args.use_tinker_loss:
+        print("[WARN] Enabling use_tinker_loss to match RLSD training flow.")
+        script_args.use_tinker_loss = True
+    if not script_args.fixed_teacher:
+        print("[WARN] Enabling fixed_teacher to match RLSD training flow.")
+        script_args.fixed_teacher = True
+
     trainer = OPSDTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
@@ -251,15 +303,41 @@ if __name__ == "__main__":
         eval_dataset=None,
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
-        use_thinking_machines_loss=script_args.use_tinker_loss,
-        fixed_teacher=script_args.fixed_teacher,
+        use_thinking_machines_loss=True,
+        fixed_teacher=True,
         reason_first=script_args.reason_first,
         top_k_loss=script_args.top_k_loss if script_args.top_k_loss > 0 else None,
-        use_ema_teacher=script_args.use_ema_teacher,
+        use_ema_teacher=False,
         ema_decay=script_args.ema_decay,
+        num_generations=script_args.num_generations,
+        low_advantage_threshold=script_args.low_advantage_threshold,
+        periodic_sft_interval=script_args.periodic_sft_interval,
+        periodic_sft_dataset_size=script_args.periodic_sft_dataset_size,
+        periodic_sft_epochs=script_args.periodic_sft_epochs,
+        periodic_sft_batch_size=script_args.periodic_sft_batch_size,
+        periodic_sft_learning_rate=script_args.periodic_sft_learning_rate,
+        periodic_sft_max_samples=script_args.periodic_sft_max_samples,
     )
 
-    trainer.train()
+    from pathlib import Path
+
+    def find_latest_checkpoint(output_dir: str) -> str | None:
+        checkpoint_dirs = [p for p in Path(output_dir).glob("checkpoint-*") if p.is_dir()]
+        if not checkpoint_dirs:
+            return None
+        latest_checkpoint = max(checkpoint_dirs, key=lambda p: p.stat().st_mtime)
+        return str(latest_checkpoint)
+
+    resume_checkpoint = getattr(training_args, "resume_from_checkpoint", None)
+    if resume_checkpoint is None:
+        resume_checkpoint = find_latest_checkpoint(training_args.output_dir)
+
+    if resume_checkpoint:
+        print(f"Resuming training from checkpoint: {resume_checkpoint}")
+    else:
+        print("No checkpoint found; starting training from scratch.")
+
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     if training_args.eval_strategy != "no":
         generation_config = GenerationConfig(
@@ -269,7 +347,5 @@ if __name__ == "__main__":
         )
         completions_callback = LogCompletionsCallback(trainer, generation_config, num_prompts=8)
         trainer.add_callback(completions_callback)
-
-    trainer.train()
 
     trainer.save_model(training_args.output_dir)

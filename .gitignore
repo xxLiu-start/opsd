@@ -1,25 +1,34 @@
-# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.egg-info/
-dist/
-build/
-.eggs/
 
-# Environments
-.env
-.venv
-env/
+.venv/
 venv/
+env/
+*.egg-info/
 
-# Training outputs
+.ipynb_checkpoints/
+.cache/
+
+*.log
 wandb/
-outputs/
-checkpoints/
 runs/
-logs/
+outputs/
+output/
+checkpoints/
+checkpoint-*/
 
-# OS
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+data/
+dataset/
+datasets/
+model/
+models/
+
 .DS_Store
+.vscode/
